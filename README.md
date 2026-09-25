@@ -97,6 +97,7 @@ N 的实际覆盖碎片。
 | POST | `/api/analyses/{id}/simulate` | 基于已保存版本预演 add/replace/remove 规则变更（**不落库**），返回新分析结果与语义差异 |
 | POST | `/api/analyses/{id}/merge-precheck` | **双批次变更合并预检**：A、B 两组 add/replace/remove 基于同一基线分别重算，检测结构冲突/地址动作冲突/合并冲突（**不落库**），无冲突时返回合并分析与相对基线差异 |
 | POST | `/api/analyses/{id}/quarantine-plan` | **临时封禁方案预演**：给定严格目标 CIDR 与新规则 ID 前缀，确定性生成 `priority=0` 的 deny 新增规则清单，使目标内全部转为 deny、目标外动作不变（**不落库**） |
+| POST | `/api/analyses/{id}/traffic-audit` | **访问观测归因**：把一批观测到的访问记录（IP + 实际动作 + 可选次数）按 LPM + 同前缀优先级归因到胜出规则，逐条核对一致性并加权汇总（**不落库**） |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
@@ -581,6 +582,113 @@ permit /24 洞之外都已是 deny，因此只生成一条规则，实际转 den
 预演是只读的：重复调用结果完全确定（相同规则集、相同目标与前缀得到相同 ID 序列与
 `ruleset_hash`），数据库不新增任何分析版本，发布指针不变。
 
+### 访问观测归因（traffic audit）
+
+`POST /api/analyses/{id}/traffic-audit` 在**已保存版本**之上，把一批**观测到的访问记录**
+逐条归因到"本应裁决它"的规则，并核对观测动作与预期动作是否一致。与 decision-map 一样，
+本端点**只读取该版本已保存的规则**：不重跑分析器、不新建分析版本、不写库。
+
+请求体（`records` 为**非空数组**）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `ip` | 观测到的 IPv4/IPv6 **地址**（单个地址，不带前缀长度；`10.0.0.0/24` 这类写法会被拒绝） |
+| `action` | 实际观测到的动作 `permit`/`deny`（别名同规则：`allow`/`accept`/`pass`、`block`/`drop`/`reject`，大小写不敏感） |
+| `count` | 可选**正整数**次数（权重），默认 `1`；`0`、负数、布尔、浮点、字符串都会被拒绝 |
+
+归因语义（与分析引擎的转发裁决完全一致，**绝不按记录顺序或"第一条命中的规则"归因**）：
+
+1. **最长前缀胜出**：在覆盖该地址的同族规则中取前缀最长者——即使短前缀规则提交在前；
+2. **同 CIDR 并列**按 `priority`（数字小者胜）再按**原提交顺序**裁决，落选的 duplicate
+   永远不会被归因；
+3. **没有任何规则覆盖的地址明确标为 `uncovered`**：`matched_rule_id` / `expected_action` /
+   `consistent` 均为 `null`，**不会**被推断成 permit 或 deny，也不计入一致/不一致。
+
+响应逐条返回（`results`，按输入顺序，`seq` 为从 0 起的序号）：命中规则
+`matched_rule_id`、预期动作 `expected_action`、一致性（`verdict` 三态
+`consistent`/`mismatch`/`uncovered` 与可空布尔 `consistent`）。加权次数（`count` 之和）
+分三个维度汇总：
+
+- `by_rule`：按**胜出规则**分组的记录条数与加权次数（含一致/不一致拆分），按加权次数降序；
+- `mismatches`：**动作不一致**按（规则、预期动作、观测动作）分组的加权次数；
+- `uncovered`：**未覆盖**按（IP 族、观测动作）分组的加权次数；
+- `summary`：总条数/总加权次数、覆盖与未覆盖、一致与不一致、IPv4/IPv6 各自的汇总。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/traffic-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "records": [
+      {"ip": "10.10.1.7",  "action": "permit", "count": 3},
+      {"ip": "10.10.1.7",  "action": "deny"},
+      {"ip": "10.10.2.9",  "action": "permit", "count": 2},
+      {"ip": "10.20.0.4",  "action": "permit"},
+      {"ip": "192.0.2.8",  "action": "deny"},
+      {"ip": "2001:db8::1", "action": "deny",  "count": 5}
+    ]
+  }'
+```
+
+以上文 `dc-2026-09` 版本（`permit 10.0.0.0/8 → deny 10.10.0.0/16 → permit 10.10.1.0/24`，
+另有 `deny 2001:db8::/32`）为例，响应（节选）：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "record_count": 6,
+  "results": [
+    {"seq": 0, "ip": "10.10.1.7", "ip_version": 4, "observed_action": "permit", "count": 3,
+     "verdict": "consistent", "matched_rule_id": "r3", "expected_action": "permit", "consistent": true},
+    {"seq": 1, "ip": "10.10.1.7", "ip_version": 4, "observed_action": "deny", "count": 1,
+     "verdict": "mismatch", "matched_rule_id": "r3", "expected_action": "permit", "consistent": false},
+    {"seq": 2, "ip": "10.10.2.9", "ip_version": 4, "observed_action": "permit", "count": 2,
+     "verdict": "mismatch", "matched_rule_id": "r2", "expected_action": "deny", "consistent": false},
+    {"seq": 4, "ip": "192.0.2.8", "ip_version": 4, "observed_action": "deny", "count": 1,
+     "verdict": "uncovered", "matched_rule_id": null, "expected_action": null, "consistent": null}
+  ],
+  "by_rule": [
+    {"rule_id": "r4", "action": "deny", "records": 1, "count": 5,
+     "consistent_count": 5, "mismatch_count": 0},
+    {"rule_id": "r3", "action": "permit", "records": 2, "count": 4,
+     "consistent_count": 3, "mismatch_count": 1},
+    {"rule_id": "r2", "action": "deny", "records": 1, "count": 2,
+     "consistent_count": 0, "mismatch_count": 2},
+    {"rule_id": "r1", "action": "permit", "records": 1, "count": 1,
+     "consistent_count": 1, "mismatch_count": 0}
+  ],
+  "mismatches": [
+    {"rule_id": "r2", "expected_action": "deny", "observed_action": "permit", "records": 1, "count": 2},
+    {"rule_id": "r3", "expected_action": "permit", "observed_action": "deny", "records": 1, "count": 1}
+  ],
+  "uncovered": [
+    {"ip_version": 4, "observed_action": "deny", "records": 1, "count": 1}
+  ],
+  "summary": {
+    "record_count": 6, "total_count": 13,
+    "covered": {"records": 5, "count": 12},
+    "uncovered": {"records": 1, "count": 1},
+    "consistent": {"records": 3, "count": 9},
+    "mismatch": {"records": 2, "count": 3},
+    "ipv4": {"records": 5, "count": 8},
+    "ipv6": {"records": 1, "count": 5}
+  }
+}
+```
+
+注意 `10.10.2.9` 归因到 `deny 10.10.0.0/16`（r2）而非提交在前的 `permit 10.0.0.0/8`
+（r1）——最长前缀优先；`192.0.2.8` 没有任何规则覆盖，明确标为 `uncovered`。
+
+错误码：
+
+- 任一记录的 `ip` 非法（语法错误、带前缀长度等）→ **整批拒绝** `400`，形如
+  `{"error": "invalid_traffic_audit", "detail": "...", "issues": ["record #1: ...", "..."]}`
+  （`issues` 一次性列出全部非法记录）；
+- 字段层面错误（未知动作、`count` 非正整数、缺字段、多余字段、`records` 为空等）→ `422`；
+- 版本不存在 → `404`。
+
+归因是只读的：重复调用结果完全确定，数据库不新增任何分析版本，发布指针不变。
+
 ### 已保存版本的 CIDR 决策地图（decision map）
 
 针对**已保存版本**（不会新建分析、不写库），给定一个严格的 IPv4/IPv6 CIDR 查询
@@ -959,6 +1067,8 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 - 临时封禁方案生成的 rule_id 撞上基线已有 ID → `400`，形如
   `{"error": "invalid_quarantine_plan", "detail": "generated rule_id(s) collide ...: q1; ..."}`
   （存在 `priority=0` 单地址阻碍时不是错误：返回 `200` 且 `generated: false`）
+- 访问观测批次中存在非法 IP（语法错误、带前缀长度等）→ **整批拒绝** `400`，形如
+  `{"error": "invalid_traffic_audit", "detail": "...", "issues": ["record #2: invalid IP address ..."]}`
 - 发布指针的 `expected_revision` 与当前 revision 不一致（并发发布冲突）→ `409`，形如
   `{"error": "revision_conflict", "detail": "...", "current": {"active_id": "...", "revision": 2}}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
@@ -980,6 +1090,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数，可独立使用）
 │   ├── quarantine_plan.py # 临时封禁方案：决策分块 + p0 同网段细分 + 真实分析/语义差异复核（纯函数，可独立使用）
+│   ├── traffic_audit.py   # 访问观测归因：单地址 LPM 裁决 + 一致性核对 + 加权汇总（纯函数，可独立使用）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
@@ -992,6 +1103,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
 ├── tests/test_quarantine_plan.py # 临时封禁方案端点测试（细分、阻碍网段、ID 撞号、IPv6）
+├── tests/test_traffic_audit.py  # 访问观测归因端点测试（LPM 归因、并列裁决、未覆盖、加权汇总、IPv6）
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化

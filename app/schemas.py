@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from .analyzer import ValidationError, normalize_action
 from .change_guard import GUARD_ACTIONS
@@ -181,6 +181,45 @@ class QuarantinePlanRequest(BaseModel):
         if not v:
             raise ValueError("must not be empty")
         return v
+
+
+class TrafficRecordIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ip: str = Field(
+        ..., description="IPv4/IPv6 address of the observed access (a plain address, no prefix length)"
+    )
+    action: str = Field(..., description="Observed action: permit/allow or deny/block/drop/reject")
+    count: StrictInt = Field(
+        default=1,
+        ge=1,
+        description="Optional positive integer weight: how many observations this record stands for",
+    )
+
+    @field_validator("action")
+    @classmethod
+    def _normalize_action(cls, v: str) -> str:
+        try:
+            return normalize_action(v)
+        except ValidationError as exc:
+            # Pydantic turns ValueError into a 422 validation error response.
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("ip")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
+class TrafficAuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[TrafficRecordIn] = Field(
+        ..., min_length=1, description="Non-empty list of observed access records"
+    )
 
 
 class ActivateRequest(BaseModel):
