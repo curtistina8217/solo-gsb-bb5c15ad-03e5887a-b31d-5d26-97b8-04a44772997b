@@ -6,6 +6,7 @@ POST   /api/analyze                          analyze a rule set (optionally pers
 POST   /api/analyses/{id}/simulate           preview add/replace/remove changes without saving
 POST   /api/analyses/{id}/merge-precheck     precheck merging two change batches on one base version
 POST   /api/analyses/{id}/quarantine-plan    deterministic deny-rule plan that quarantines one CIDR (preview only)
+POST   /api/analyses/{id}/traffic-audit      attribute observed access records to winning rules (read-only)
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -47,8 +48,10 @@ from .schemas import (
     MergePrecheckRequest,
     QuarantinePlanRequest,
     SimulateRequest,
+    TrafficAuditRequest,
 )
 from .simulate import PatchError, apply_patch, rebuild_input_rules
+from .traffic_audit import TrafficAuditError, audit_traffic, parse_observations
 
 
 @asynccontextmanager
@@ -102,6 +105,16 @@ async def _change_guard_error_handler(_request, exc: ChangeGuardError):
     return JSONResponse(
         status_code=400,
         content={"error": "invalid_change_guard", "detail": str(exc), "issues": exc.issues},
+    )
+
+
+@app.exception_handler(TrafficAuditError)
+async def _traffic_audit_error_handler(_request, exc: TrafficAuditError):
+    # The whole observation batch is rejected; every offending record is
+    # reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_traffic_audit", "detail": str(exc), "issues": exc.issues},
     )
 
 
@@ -285,6 +298,35 @@ def quarantine_plan(analysis_id: str, req: QuarantinePlanRequest) -> dict[str, A
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
 
     return plan_quarantine(base, target, req.rule_id_prefix)
+
+
+@app.post("/api/analyses/{analysis_id}/traffic-audit", status_code=200)
+def traffic_audit(analysis_id: str, req: TrafficAuditRequest) -> dict[str, Any]:
+    """Attribute a batch of observed access records to this version's rules.
+
+    Each record carries a bare IPv4/IPv6 address, the actually observed
+    action (``permit``/``deny``) and an optional positive integer ``count``
+    (default 1).  Every address is adjudicated with the engine's own
+    semantics — longest prefix match, same-CIDR ties broken by priority and
+    then original submission order — never by the request's record order or
+    a first-match scan.  Per record the response reports the winning
+    ``rule_id``, the ``expected_action`` and whether the observed action is
+    consistent with it; an address no rule covers is explicitly
+    ``uncovered`` (``expected_action: null``, never inferred as permit or
+    deny).  Weighted counts are aggregated per winning rule, per action
+    mismatch and for the uncovered surface.  The batch is all-or-nothing:
+    one invalid ip/action/count rejects the whole request.  Read-only:
+    nothing is persisted and the version is never modified.
+    """
+    # The observation batch is validated before the version is looked up,
+    # mirroring the quarantine-plan endpoint's format-before-existence order.
+    observations = parse_observations([r.model_dump() for r in req.records])
+
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    return audit_traffic(base, observations)
 
 
 @app.get("/api/analyses/{analysis_id}/rules")
